@@ -81,11 +81,9 @@ def _add_usage(resp: Any, tag: str = "", model: str = "") -> Dict[str, int]:
 load_dotenv()
 
 
-
 client_llm = OpenAI(
-    base_url="https://api2.aigcbest.top/v1",
-    # api_key="sk-DxXcnt6PCCKHOO3BQ27K2h8Cdbo4zWALMUuOUG8dwe6hEktk",
-    api_key = "sk-WtUTeeyKVeQNsBqYVZLaOe1h5iAyHaTLqp2hdCOliGPRFwxo",
+    base_url=os.getenv("BASE_URL", "https://api.openai.com/v1"),
+    api_key=os.getenv("API_KEY", "dummy"),
 )
 
 client_uitars = OpenAI(

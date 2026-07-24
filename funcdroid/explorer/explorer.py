@@ -700,7 +700,7 @@ Output STRICT JSON (NO extra text, NO markdown):
         new_fdg_file_path = f"{base}_with_data_dep{ext}"
         self.save_FDG(new_fdg_file_path)
         print(f"[Info] FDG with data dependencies saved to {new_fdg_file_path}")
-        out_dir = Path("C:\\Users\\23314\\Desktop\\Fim\\output")
+        out_dir = Path(os.path.dirname(os.path.abspath(fdg_file_path)))
         out_dir.mkdir(parents=True, exist_ok=True)
         token_path = out_dir / "LLM-Token-Stats.json"
         token_stats = globals().get("TOKEN_STATS", None)

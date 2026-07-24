@@ -21,11 +21,10 @@ class U2(Automator):
             raise TypeError('expected an App, not %s' % type(app).__name__)
 
     def uninstall_app(self, app):
-        pass
-        # if isinstance(app, App):
-        #     self._driver.uninstall_app(app.package_name)
-        # else:
-        #     raise TypeError('expected an App, not %s' % type(app).__name__)
+        if isinstance(app, App):
+            self._driver.app_uninstall(app.package_name)
+        else:
+            raise TypeError('expected an App, not %s' % type(app).__name__)
 
     def start_app(self, app):
         if isinstance(app, App):

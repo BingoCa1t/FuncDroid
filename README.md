@@ -68,24 +68,28 @@ Notes:
 
 ## API Key / LLM Configuration
 
-FuncDroid loads LLM settings from environment variables (via `python-dotenv`). Use the provided example file:
+FuncDroid 的 LLM 配置直接写在 `funcdroid/explorer/llm.py` 中。**只需修改变量值，不要改动文件其他部分**：
 
-1) Copy `.env.example` to `.env`
-2) Fill in your endpoint/model/key values
+打开 `funcdroid/explorer/llm.py`，找到以下两处并替换为自己的 API 信息：
 
-```ini
-# Specialized LLM settings 
-SPECIALIZED_BASE_URL="https://ark.cn-beijing.volces.com/api/v3/"
-SPECIALIZED_MODEL="doubao-seed-1-6-vision-250815"
-SPECIALIZED_API_KEY="doubao_api_key"
+```python
+# 通用 LLM — 结构化推理 (如 DeepSeek / GPT-4o)
+client_llm = OpenAI(
+    base_url="https://api.deepseek.com/v1/",   # ← 改为你的 API 地址
+    api_key="sk-your-api-key",                  # ← 改为你的 API Key
+)
 
-# General LLM settings 
-BASE_URL="openai_url"
-MODEL="gpt-4o"
-API_KEY=""
+# 专用 LLM — 视觉理解 (如 豆包 Vision / GPT-4o)
+client_uitars = OpenAI(
+    base_url="https://ark.cn-beijing.volces.com/api/v3/",  # ← 改为你的 API 地址
+    api_key="your-api-key",                                  # ← 改为你的 API Key
+)
 ```
 
-Then run any Python entrypoint; `python-dotenv` loads `.env` automatically.
+**注意**：
+- 只修改 `base_url` 和 `api_key` 字符串的值，其他代码保持不变
+- 不需要创建 `.env` 文件
+- 两个 client 可以使用同一个 API 提供商（填相同的 URL 和 Key）
 
 ## Quick Start
 
