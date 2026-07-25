@@ -31,7 +31,7 @@ def get_current_app_package() -> str:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         return (p.stdout or "").strip()
 
-    out = _run(r'adb shell dumpsys window | findstr mCurrentFocus')
+    out = _run(r'adb shell dumpsys window | grep mCurrentFocus')
     m = re.search(r"\s([a-zA-Z0-9_\.]+)\/", out)
     if m:
         return m.group(1)
@@ -52,7 +52,7 @@ class Explorer:
         self.page_nodes: list[PageNode] = []
         self.FDG: list[FDGNode] = []
 
-        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.executor = ThreadPoolExecutor(max_workers=1)
 
         self.path = []
 
@@ -472,7 +472,7 @@ Output STRICT JSON (NO extra text, NO markdown):
         processed_edges = set()                 # (src_page_idx, edge_idx)
         expanded_state = set([(start_node.index, 0)])  # (page_idx, fdg_id)
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor:
             while not q.empty():
                 batch = []
                 while not q.empty():
@@ -1329,13 +1329,12 @@ The length of variant_paths must be less than or equal to 3.
             main_task = _core_logic_to_task(core)
             print(f"\n[Core Logic Task]\n{main_task}")
 
-            # try:
-            #     self._replay_to_page(entry_page_node)
-            #     path_record = self._test_function(task_description=main_task)
-            #     self.detect_bug_from_path_record(path_record)
-            #     pass
-            # except Exception as e:
-            #     print(f"[TaskTest] Core logic execution failed for FDG[{fdg_idx}]: {e}")
+            try:
+                self._replay_to_page(entry_page_node)
+                path_record = self._test_function(task_description=main_task)
+                self.detect_bug_from_path_record(path_record)
+            except Exception as e:
+                print(f"[TaskTest] Core logic execution failed for FDG[{fdg_idx}]: {e}")
 
             widget_desc_list = _collect_widget_descriptions(fdg_node)
             mutation_content = [
@@ -1361,14 +1360,14 @@ The length of variant_paths must be less than or equal to 3.
             for i, v in enumerate(variants, 1):
                 print(f" - V{i}: {v}")
 
-            # for i, task in enumerate(variants, 1):
-            #     try:
-            #         self._replay_to_page(entry_page_node)
-            #         path_record = self._test_function(task_description=task)
-            #         self.detect_bug_from_path_record(path_record)
-            #         break
-            #     except Exception as e:
-            #         print(f"[TaskTest] Variant V{i} failed for FDG[{fdg_idx}]: {e}")
+            for i, task in enumerate(variants, 1):
+                try:
+                    self._replay_to_page(entry_page_node)
+                    path_record = self._test_function(task_description=task)
+                    self.detect_bug_from_path_record(path_record)
+                    break
+                except Exception as e:
+                    print(f"[TaskTest] Variant V{i} failed for FDG[{fdg_idx}]: {e}")
 
 
     def app_level_test(self):
@@ -1543,47 +1542,47 @@ Output STRICT JSON ONLY (and nothing else):
                     print("-" * 30)
 
 
-            # # ---------- 2.2 Execute producer ----------
-            # path_record = []
+            # ---------- 2.2 Execute producer ----------
+            path_record = []
 
-            # producer_entry = _entry_page_node(fdg_node_before)
-            # if producer_entry is None:
-            #     print("[AppTest] Producer entry page not found. Skip this pair.")
-            #     continue
+            producer_entry = _entry_page_node(fdg_node_before)
+            if producer_entry is None:
+                print("[AppTest] Producer entry page not found. Skip this pair.")
+                continue
 
-            # try:
-            #     self._replay_to_page(producer_entry)
-            #     pr = self._test_function(task_description=producer_task)
-            #     if isinstance(pr, list):
-            #         path_record.extend(pr)
-            #     else:
-            #         path_record.append(pr)
-            # except Exception as e:
-            #     print(f"[AppTest] Producer execution failed for {producer_idx}->{consumer_idx}: {e}")
-            #     continue
+            try:
+                self._replay_to_page(producer_entry)
+                pr = self._test_function(task_description=producer_task)
+                if isinstance(pr, list):
+                    path_record.extend(pr)
+                else:
+                    path_record.append(pr)
+            except Exception as e:
+                print(f"[AppTest] Producer execution failed for {producer_idx}->{consumer_idx}: {e}")
+                continue
 
-            # # ---------- 2.3 Execute consumer ----------
-            # consumer_entry = _entry_page_node(fdg_node_after)
-            # if consumer_entry is None:
-            #     print("[AppTest] Consumer entry page not found. Skip this pair.")
-            #     continue
+            # ---------- 2.3 Execute consumer ----------
+            consumer_entry = _entry_page_node(fdg_node_after)
+            if consumer_entry is None:
+                print("[AppTest] Consumer entry page not found. Skip this pair.")
+                continue
 
-            # try:
-            #     self._replay_to_page(consumer_entry)
-            #     cr = self._test_function(task_description=consumer_task)
-            #     if isinstance(cr, list):
-            #         path_record.extend(cr)
-            #     else:
-            #         path_record.append(cr)
-            # except Exception as e:
-            #     print(f"[AppTest] Consumer execution failed for {producer_idx}->{consumer_idx}: {e}")
-            #     pass
+            try:
+                self._replay_to_page(consumer_entry)
+                cr = self._test_function(task_description=consumer_task)
+                if isinstance(cr, list):
+                    path_record.extend(cr)
+                else:
+                    path_record.append(cr)
+            except Exception as e:
+                print(f"[AppTest] Consumer execution failed for {producer_idx}->{consumer_idx}: {e}")
+                pass
 
-            # # ---------- 2.4 Final check for this pair ----------
-            # try:
-            #     self.detect_bug_from_path_record(path_record)
-            # except Exception as e:
-            #     print(f"[AppTest] detect_bug_from_path_record failed for {producer_idx}->{consumer_idx}: {e}")
+            # ---------- 2.4 Final check for this pair ----------
+            try:
+                self.detect_bug_from_path_record(path_record)
+            except Exception as e:
+                print(f"[AppTest] detect_bug_from_path_record failed for {producer_idx}->{consumer_idx}: {e}")
 
 
     def _replay_to_page(self, page_node):

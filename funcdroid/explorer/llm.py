@@ -5,6 +5,7 @@ from threading import Lock
 from typing import Any, Dict
 
 TOKEN_LOCK = Lock()
+LLM_LOCK = Lock()  # serialise all LLM API calls — the backend does not support concurrency
 
 TOKEN_STATS: Dict[str, int] = {
     "calls": 0,
@@ -104,73 +105,77 @@ client_uitars = OpenAI(
 
 
 def ask_llm(content):
-    resp = client_uitars.responses.create(
-        model=os.getenv("SPECIALIZED_MODEL"),
-        input=[{
-            "role": "user",
-            "content": content
-        }],
-        temperature=0,
-        extra_body={
-            "thinking": {
-                "type": "disabled",
+    with LLM_LOCK:
+        resp = client_uitars.responses.create(
+            model=os.getenv("SPECIALIZED_MODEL"),
+            input=[{
+                "role": "user",
+                "content": content
+            }],
+            temperature=0,
+            extra_body={
+                "thinking": {
+                    "type": "disabled",
+                },
             },
-        },
-    )
-    # print(resp.output_text)
-    _add_usage(resp, tag="ask_llm", model=os.getenv("SPECIALIZED_MODEL") or "")
-    return resp.output_text
+        )
+        # print(resp.output_text)
+        _add_usage(resp, tag="ask_llm", model=os.getenv("SPECIALIZED_MODEL") or "")
+        return resp.output_text
 
 
 def ask_uitars(content):
-    resp = client_uitars.responses.create(
-        model=os.getenv("SPECIALIZED_MODEL"),
-        input=[{
-            "role": "user",
-            "content": content
-        }],
-        temperature=0,
-        extra_body={
-            "thinking": {
-                "type": "disabled",
+    with LLM_LOCK:
+        resp = client_uitars.responses.create(
+            model=os.getenv("SPECIALIZED_MODEL"),
+            input=[{
+                "role": "user",
+                "content": content
+            }],
+            temperature=0,
+            extra_body={
+                "thinking": {
+                    "type": "disabled",
+                },
             },
-        },
-    )
-    # print(resp.output_text)
-    _add_usage(resp, tag="ask_uitars", model=os.getenv("SPECIALIZED_MODEL") or "")
-    return resp.output_text
+        )
+        # print(resp.output_text)
+        _add_usage(resp, tag="ask_uitars", model=os.getenv("SPECIALIZED_MODEL") or "")
+        return resp.output_text
 
 def ask_uitars_without_thinking(content):
-    resp = client_uitars.responses.create(
-        model=os.getenv("SPECIALIZED_MODEL"),
-        input=[{
-            "role": "user",
-            "content": content
-        }],
-        temperature=0,
-        extra_body={
-            "thinking": {
-                "type": "disabled",
+    with LLM_LOCK:
+        resp = client_uitars.responses.create(
+            model=os.getenv("SPECIALIZED_MODEL"),
+            input=[{
+                "role": "user",
+                "content": content
+            }],
+            temperature=0,
+            extra_body={
+                "thinking": {
+                    "type": "disabled",
+                },
             },
-        },
-    )
-    _add_usage(resp, tag="ask_uitars_without_thinking", model=os.getenv("SPECIALIZED_MODEL") or "")
-    return resp.output_text
+        )
+        _add_usage(resp, tag="ask_uitars_without_thinking", model=os.getenv("SPECIALIZED_MODEL") or "")
+        return resp.output_text
 
 
 def ask_uitars_messages(messages):
-    resp = client_uitars.responses.create(
-        model=os.getenv("SPECIALIZED_MODEL"),
-        input=messages,
-        temperature=0,
-        extra_body={
-            "thinking": {
-                "type": "disabled",
+    with LLM_LOCK:
+        resp = client_uitars.responses.create(
+            model=os.getenv("SPECIALIZED_MODEL"),
+            input=messages,
+            temperature=0,
+            extra_body={
+                "thinking": {
+                    "type": "disabled",
+                },
             },
-        },
-    )
-    _add_usage(resp, tag="ask_uitars_messages", model=os.getenv("SPECIALIZED_MODEL") or "")
-    return resp.output_text
+        )
+        _add_usage(resp, tag="ask_uitars_messages", model=os.getenv("SPECIALIZED_MODEL") or "")
+        return resp.output_text
 
 
 

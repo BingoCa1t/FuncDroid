@@ -155,26 +155,895 @@ class FDGNode:
 
 **重要**：当前代码中 `client_llm` 被定义但未被使用——所有 LLM 调用都走 `client_uitars`。
 
-#### 3.3.2 提示词模块（`prompt.py`）
+#### 3.3.2 提示词模块（`prompt.py` + `explorer.py` 内联）
 
-约 15 个精心设计的 prompt template，按用途分类：
+全部 LLM 提示词共约 20 个，分布在 `prompt.py`（16 个全局定义）和 `explorer.py`（5 个内联定义）中。以下按使用阶段分类列出完整原文。
 
-| Prompt | 用途 | 关键约束 |
-|--------|------|----------|
-| `get_widgets_from_page_prompt` | 从前后页面对比中提取新增交互控件 | 只识别新增控件、同类去重（保留代表）、排除系统 UI |
-| `initial_page_prompt` | 首页控件识别 | 特殊规则：底部 Tab 栏必须全部枚举 |
-| `test_function_prompt` | 指导 Agent 执行一个功能测试任务 | 支持 click/input/long_click/press_back/finished |
-| `bug_detection_prompt` | 实时 bug 检测（探索过程中） | 区分 crash bug 和 functional bug |
-| `path_bug_detection_prompt` | 事后路径级 bug 检测（测试完成后） | 相同分类但从序列角度判断 |
-| `bug_recheck_prompt` | 结合知识库二次确认 | 更保守，宁可漏报不可误报 |
-| `page_exist_prompt` | 页面去重的最后手段（LLM 视觉比对） | 结构相同但内容不同 = 同一页面 |
-| `FDG_function_description_prompt` | 为 FDG 节点生成功能描述 | 结合导航路径上下文 |
-| `page_to_page_prompt` | 边分类：是否新建功能节点 + data_in/data_out | 严格的导航/数据分离规则 |
-| `page_to_widget_prompt` | Widget 级功能点判断 | widget 组内去重 |
-| `data_flow_prompt` | 推断 FDG 节点间数据依赖 | 高召回策略（语义等价的实体视为匹配） |
-| `data_flow_prompt_without_data` | 同上但无 data_in/out（仅从描述推断） | 高精度策略（宁可少不可错） |
-| `task_planning_prompt` | 生成变体测试路径 | 主路径 + 2~3 变体（边界/异常） |
-| `get_position_prompt` | Widget 重定位（点击前确认坐标） | 返回 [x, y] 或 [0, 0] |
+> **命名约定**：`prompt.py` 中的变量使用 snake_case（如 `get_widgets_from_page_prompt`），`explorer.py` 内联定义的局部变量使用 UPPER_SNAKE_CASE（如 `FDG_EDGE_CLASSIFY_PROMPT`）。`test_function_prompt` 和 `FDG_function_description_prompt` 在两处各有一份定义（内联版本覆盖导入版本）。
+
+---
+
+##### A. Phase 1: PTG 探索阶段
+
+**a) `initial_page_prompt`** — 首页控件识别（`prompt.py:63`）
+
+> 与 `get_widgets_from_page_prompt` 的区别：无需前后对比，且对 Bottom Tab 栏有特殊规则——必须全部枚举而非去重。
+
+```text
+You are a professional Mobile GUI Analysis Assistant. You will receive a screenshot of a mobile app's current page.
+
+### Core Task
+Analyze the screenshot to accurately identify all interactive widgets, adhering to the specified criteria.
+
+### 1. Widget Recognition Standards
+- Define "interactive widgets" as elements supporting user actions (e.g., click, input, state toggle).
+- For batch identical-function widgets (e.g., repetitive cards in a list/grid), select **only one representative** (avoid redundant entries),
+  **except for Bottom Tab bars**.
+- Ensure no omission of unique interactive elements; prioritize functional distinctiveness over visual duplication.
+
+### 2. Bottom Tab Bar (Special Rule — MUST FOLLOW)
+- **All Bottom Tab bar items MUST be identified individually**, even if they share similar structure or appearance.
+- Do NOT deduplicate Bottom Tab items. Each tab (e.g., Home, Search, Favorite, Settings) must be listed as a separate widget.
+- Treat Bottom Tab items as navigation controls (`is_leaf = false`).
+
+### 3. Field Definitions (Precise Guidelines)
+- is_leaf:
+  - `true`: Widgets that toggle states (Switch, Checkbox) or select options **without triggering page navigation/redirection**.
+  - `false`: Widgets that initiate page navigation, confirm actions (Login, Search, Submit), or **open new layers/pages**
+    (including Bottom Tab switches, modals, and tab changes).
+- content:
+  - Input Fields: Generate a **contextually relevant, realistic sample value** aligned with the field's label/hint (avoid generic placeholders).
+  - Clickable Elements (buttons, links, toggles): Return an empty string "".
+
+### Important Notes
+- Bottom Tab bar widgets are an exception to the representative-widget rule and must be **fully enumerated**.
+- Representative Widget per Category applies ONLY to non-tab repetitive items (e.g., list cards, grid items).
+
+### Output Format (Strict Compliance)
+Return **exactly one JSON object** (no markdown code fences, comments, or extra text).
+{
+  "function_description": "Concise summary of the page's core function (≤20 words)",
+  "widgets": [
+    {
+      "description": "Clear, functional description of the widget (≤20 words)",
+      "action": "click" or "input",
+      "content": "Sample value if 'input'; empty string '' if 'click'",
+      "position": [x, y], // Center coordinates (normalized 0–1000)
+      "is_leaf": true/false,
+      "postcondition": "Concise prediction of immediate post-interaction behavior (≤30 words)"
+    }
+  ]
+}
+```
+
+**b) `get_widgets_from_page_prompt`** — 从前后页面对比中提取新增交互控件（`prompt.py:1`）
+
+```text
+You are a professional Mobile GUI Analysis Assistant. You will receive:
+1. A screenshot before action.
+2. A screenshot after action (current page).
+3. The user action performed.
+
+### Core Task
+Analyze the screenshots to accurately identify all interactive widgets on the current page, adhering to the specified criteria.
+
+### 1. Widget Recognition Standards
+#### 1.1 Definition of Interactive Widgets
+- Interactive widgets refer to elements supporting user operations, including but not limited to: clickable buttons, input fields, state-toggle widgets (Switch/Checkbox), dropdown menu options, and operation buttons in popups.
+
+#### 1.2 Core Scope (Based on Screenshot Comparison)
+- Compare the "screenshot before action" and "current page screenshot" strictly; **only identify interactive widgets that are newly added or newly visible on the current page**.
+- Fully ignore interactive widgets that already existed and remained unchanged in the "screenshot before action".
+
+#### 1.3 Deduplication & Batch Widget Handling Rules
+- For batch identical-function widgets (e.g., homogeneous cards in a list, multiple identical buttons) on the current page: select **only one representative** to avoid redundant entries.
+- For functionally differentiated widgets (e.g., different options in a dropdown menu, buttons with distinct labels): retain all without deduplication.
+- For long homogeneous data lists (e.g., list rows with identical structure): extract **only one representative item** (do not identify all entries).
+
+#### 1.4 Exclusion Rules
+- Ignore system-level UI elements (e.g., system Back/Home buttons) unless the current page has no other interactive widgets.
+- Ignore persistent static elements (e.g., top navigation bar, bottom tab bar) that show no visual changes compared to the "screenshot before action" (do not re-identify them).
+
+### 2. Field Definitions (Precise Guidelines)
+- is_leaf:
+  - `true`: Widgets that toggle states or select options **without triggering page navigation/redirection**.
+  - `true`: Log out buttons or exit actions that close the app without navigating to another page.
+  - `false`: Widgets that initiate page navigation, confirm actions, or **open new layers/pages**.
+- content: Generate contextually relevant, realistic sample values for input fields; empty string for clickables.
+- postcondition: Concise prediction of immediate behavior after interaction (≤30 words).
+
+### Output Format (Strict Compliance)
+Return **exactly one JSON object** (no markdown code fences, comments, or extra text).
+{
+  "function_description": "Concise summary of the page's core function (≤20 words)",
+  "widgets": [
+    {
+      "description": "Clear, functional description of the widget (≤20 words)",
+      "action": "click" or "input",
+      "content": "Sample value if 'input'; empty string '' if 'click'",
+      "position": [x, y], // Normalized 0-1000
+      "is_leaf": true/false,
+      "postcondition": "Concise prediction (≤30 words)"
+    }
+  ]
+}
+```
+
+**c) `get_position_prompt`** — Widget 坐标重定位（`prompt.py:268`）
+
+> 每次点击前调用，让 LLM 在当前截图上重新定位 widget。避免因页面滚动/布局变化导致坐标失效。最多重试 3 次。
+
+```text
+You are a mobile app GUI analysis expert.
+
+You will receive:
+1) A screenshot of the current app page.
+2) A text description of a target widget on this page.
+
+Your task:
+Determine the precise center coordinates of the target widget on the screenshot.
+
+Rules:
+- If the target widget is found, return its center coordinates as [x, y], where x and y are integers representing pixel positions.
+- If the target widget cannot be found or cannot be confidently identified, return [0, 0].
+
+Output format:
+Return ONLY a JSON object with NO extra text. The JSON object MUST contain the key "position".
+Example when found: {"position": [123, 456]}
+Example when not found: {"position": [0, 0]}
+```
+
+**d) `page_exist_prompt`** — 页面去重 LLM 视觉比对（`prompt.py:662`）
+
+> 当 imagehash 落在 0.50~0.90 灰色区间时调用。判断标准：**结构相同即同一页面**，忽略动态内容差异。
+
+```text
+You are a professional mobile app GUI comparison expert. You will be provided with:
+1. A new screenshot (current page to verify).
+2. The most similar known candidate page (from historical screenshot library).
+
+### Core Task
+Determine whether the new screenshot represents the **same page** as the candidate page, following the strict judgment rule:
+**Pages with identical structural layout (regardless of content differences) are considered the same page.**
+
+### Judgment Criteria
+1. **Structural Identity (Primary Criterion)**:
+   - Evaluate overall page layout, main functional sections, key widget placement, and navigation structure.
+   - If the core structural framework is consistent, the pages are deemed the same, regardless of content changes.
+
+2. **Ignorable Differences (Do NOT affect judgment)**:
+   - Dynamic content updates (e.g., text, images, list items, numerical values).
+   - Minor temporary elements (e.g., pop-up tips, loading spinners, notification badges).
+   - Cosmetic changes (e.g., slight color adjustments, font size variations) that do not alter layout structure.
+
+3. **Differences That Change Page Identity**:
+   - Alteration of main section layout (e.g., content area replaced, header/footer structure modified).
+   - Addition/removal of core functional sections (e.g., new sidebar, missing bottom navigation bar).
+   - Fundamental shift in key widget placement (e.g., search bar moved from top to bottom).
+
+### Output Requirements
+Return ONLY a single JSON object with no explanations, comments, or extra text:
+{"is_same_page": true or false}
+```
+
+---
+
+##### B. Phase 2: FDG 构建阶段
+
+**e) `FDG_EDGE_CLASSIFY_PROMPT`** — PTG 边分类：是否新功能点（`explorer.py:141` 内联）
+
+> BFS 遍历 PTG 时，用此 prompt 判断每条边是"同一功能内步骤"还是"新功能起点"。同时提取 data_in/data_out。
+
+```text
+You are identifying functional points and their boundaries in a mobile app.
+
+Task:
+Given the DESCRIPTION of the CURRENT functional point and the UI screenshots BEFORE and AFTER an action, decide whether this action starts a NEW functional point, or it is still part of the CURRENT functional point.
+
+What is a "functional point"?
+A functional point is a self-contained user goal that the user perceives as ONE function/goal. A functional point can be completed by a single action (one-edge function) or multiple actions (a workflow).
+
+Core principle (do NOT be too broad):
+- Do NOT merge many unrelated things into one big functional point (especially on Settings pages).
+- A functional point must have a clear and specific purpose/effect, not a vague umbrella like "Settings".
+
+Boundary rules:
+
+1) Navigation / feature entry
+- If the action clicks a feature item on a navigation list / home menu / drawer / tab list and enters that feature, then that clicked feature item should be treated as the start of a NEW functional point.
+  Example: "Notes" / "Calendar" / "Search" / "Settings" items in a navigation list → each item is a new functional point.
+
+2) Goal completion within the same function (one workflow)
+- If the action is a step to complete the same user goal within ONE feature page/workflow, it is NOT a new functional point.
+  Example 1: On a "Create Note" page, typing title/body, adding tags, and tapping "Save" are all part of "Create Note".
+  Example 2: When saving/exporting a file, the app may navigate to a "File picker" page. Selecting a folder and confirming are still part of the SAME functional point (Save/Export File).
+
+3) Settings page rule (MUST be fine-grained)
+- On a Settings page, each distinct setting item (including toggles/switches) is its own functional point.
+  Example: "Theme", "Font size", "Sync", "Notifications" → each setting item is a NEW functional point.
+- A setting item can be a one-edge functional point even if the UI does NOT navigate to a new page.
+- The options/configurations within the SAME setting item are NOT new functional points.
+
+Also extract abstract data:
+- "data_in": abstract data entities that this action uses/loads/edits/operates.
+- "data_out": abstract data entities that this action produces or updates.
+- Only include ABSTRACT entities (not UI widget names, not button text, not coordinates).
+- Use short noun phrases; de-duplicate; do not invent data not implied by the UI.
+
+Output (STRICT JSON ONLY):
+{
+  "new_functional_point": true/false,
+  "data_in": ["<abstract entity>", ...],
+  "data_out": ["<abstract entity>", ...]
+}
+Do NOT output any extra text, explanation, comments, or code fences outside the JSON.
+```
+
+**f) `FDG_FUNCTION_DESCRIPTION_PROMPT`** — FDG 节点功能描述（`explorer.py:202` 内联，覆盖 prompt.py 同名变量）
+
+```text
+App: {app_name}
+
+You are given a navigation path description to reach the current page. Summarize the functionality of the current page as a concise function description (one sentence).
+
+Path:
+{path_description}
+
+Return only plain text.
+```
+
+**g) `FDG_CORE_LOGIC_PROMPT`** — FDG 节点核心逻辑提取（`explorer.py:214` 内联）
+
+> 将属于同一功能的 action_refs 列表 + 关键页面截图发给 LLM，提取流程图式核心逻辑。
+
+```text
+You are extracting the CORE EXECUTION LOGIC of a mobile app functional point.
+
+App: {app_name}
+
+Functional point description (high-level):
+{function_description}
+
+Below is the set of actions that belong to this functional point.
+Each action is a PTG edge reference, and contains:
+- action_ref: [page_idx, edge_idx], src_page_idx, dst_page_idx (may be null)
+- action (e.g., click / input), description / content / position / is_leaf
+
+Your task:
+1) Build a FLOWCHART-LIKE structure that captures the core execution logic of this functional point:
+   - ordered steps (sequence)
+   - branch points (if-else / loop) when the flow can diverge or repeat
+2) Every step MUST correspond to EXACTLY ONE provided action_ref (no invented steps).
+3) The final output must be STRICT JSON that follows the schema below.
+
+CRITICAL CONSTRAINTS (MUST FOLLOW):
+A) No hallucination:
+   - You MUST NOT invent steps/actions that are not backed by the given actions list.
+   - Every "steps[i].action_ref" MUST appear in the given actions list.
+B) Reference integrity:
+   - All step ids referenced in "flow_edges" and "branch_points" MUST exist in "steps".
+   - "flow_edges[].from/to" must be valid step ids.
+   - "branch_points[].at_step" must be a valid step id.
+   - Every "branches[].next_step" must be a valid step id.
+C) Branch conditions:
+   - If you describe conditions (in summaries), they MUST be UI-observable
+     (e.g., "toggle is off", "input is empty", "dialog appears"),
+     NOT program variables, NOT internal states, NOT coordinates.
+D) Output field "logic" definition:
+   - "logic" MUST be a NATURAL-LANGUAGE description of the CORE EXECUTION LOGIC (2–6 sentences).
+   - It must summarize the main flow in order, and explicitly mention major decision/loop points if any.
+   - Do NOT include testing oracles, assertions, mutations, or implementation details.
+   - Do NOT mention coordinates, view ids, or program variables.
+
+Output STRICT JSON (NO extra text, NO markdown):
+{
+  "entry_page": <int|null>,
+  "logic": "<natural-language description of the core execution logic, 2-6 sentences>",
+  "steps": [
+    {
+      "id": "S1",
+      "action_ref": [page_idx, edge_idx],
+      "src_page_idx": <int>,
+      "dst_page_idx": <int|null>,
+      "action": "<string>",
+      "summary": "<what this step does>"
+    }
+  ],
+  "flow_edges": [
+    {"from": "S1", "to": "S2"}
+  ],
+  "branch_points": [
+    {
+      "at_step": "S2",
+      "type": "if-else" or "loop",
+      "branches": [
+        {"next_step": "S3"},
+        {"next_step": "S4"}
+      ]
+    }
+  ]
+}
+```
+
+**h) `page_to_widget_prompt`** — Widget 级功能点判断（`prompt.py:483`）
+
+```text
+You are a mobile app GUI functional analysis expert.
+
+You will be given:
+1. A screenshot of the current page.
+2. The functional description of a control on this page.
+
+Your task is to determine if this control represents a new functional point and analyze its specific data usage.
+
+### Part 1: Functional Point Determination
+- Return `true` if the control **leads to a new functional module or distinct feature page**.
+- Return `false` if the control **changes a state, option, or setting inside an existing feature page**.
+- **Group Rule**: If multiple controls belong to the same selection group, they are NOT separate functional points.
+
+### Part 2: Concrete Data Flow Analysis (STRICT)
+Identify the **SPECIFIC** data entities this control reads or modifies.
+**DO NOT use generic terms.** Be specific about *what* is being handled.
+- **data_in**: What specific data does this widget take in? (e.g., "Credit Card Number", "City Name")
+- **data_out**: What specific data does this widget produce or change? (e.g., "Saved Contact", "Bluetooth State: Off")
+- If it's a simple navigation button, data lists should be `[]`.
+
+### Input
+Control functional description: "{function_description}"
+
+### Output format
+Return in JSON:
+{
+  "new_functional_point": true or false,
+  "data_in": ["string", ...],
+  "data_out": ["string", ...]
+}
+Do not include explanations or any extra text.
+```
+
+---
+
+##### C. Phase 3: 数据依赖推断
+
+**i) `data_flow_prompt`** — 推断 FDG 节点间数据依赖（高召回）（`prompt.py:596`）
+
+> 基于 data_in/data_out + 功能描述进行匹配。高召回策略：语义等价的实体视为匹配。
+
+```text
+You are an expert in mobile app functional dependency analysis.
+
+You are given several functional nodes. Each node has:
+- index: integer
+- description: what this function does
+- data_in: data it uses or requires
+- data_out: data it produces or updates
+
+Your task:
+Infer **data dependencies for each node**.
+
+Definition: data_dependencies (j depends on i)
+- "i → j" means: Node j uses/reads/edits/displays data that could be produced/updated by Node i.
+- You must output **for each consumer node j**, which producer nodes i it depends on.
+
+Core rule (must use):
+- If j.data_in contains an abstract data entity that is the same as (or semantically equivalent to) an entity in i.data_out, then include i in j.data_dependencies.
+
+Relaxed rules (high recall):
+- Treat semantically similar / renamed data as the same entity (e.g., "expense record" vs "expense list").
+- If j logically continues, views, edits, deletes, filters, exports, shares, or shows statistics/history/summary for data created or updated by i, then include i → j.
+- Ignore pure navigation or UI-only actions with no real data usage.
+
+Output format — Return ONLY one valid JSON object:
+{
+  "data_dependencies": {
+    "1": [0],
+    "2": [0, 3]
+  }
+}
+Keys MUST be strings of the consumer indices. Values are lists of integers (producer node indices).
+Do NOT include a node j if it has no dependencies. Do NOT include self-dependency.
+Prefer INCLUDING a dependency when it is reasonably likely.
+```
+
+**j) `data_flow_prompt_without_data`** — 推断 FDG 节点间数据依赖（高精度）（`prompt.py:697`）
+
+> 仅从功能描述推断，无 data_in/out。高精度策略：宁可少不可错。仅当强证据时才添加依赖。
+
+```text
+You are an expert in mobile app functional dependency analysis.
+
+You are given several functional nodes. Each node has:
+- index: integer
+- description: what this function does
+
+Your task:
+Infer **data dependencies for each node** based ONLY on the descriptions.
+
+STRICT extraction policy (precision-first):
+- Extract as FEW dependencies as possible.
+- Add a dependency ONLY when the relationship is STRONGLY supported by the descriptions (high confidence).
+- If the relationship is ambiguous or only weakly related, DO NOT include it.
+
+Strong-evidence rules (must satisfy at least ONE):
+1) Same explicit entity — i and j clearly mention the same concrete entity type, and i creates/updates/deletes it while j views/edits/shares/exports/searches/filters it.
+2) Explicit create→consume pipeline — i clearly produces an output that j clearly consumes.
+3) Specific setting effect — i changes a clearly named setting/toggle, and j clearly indicates behavior/UI that depends on that exact setting.
+
+Representative-only rule for similar dependencies (IMPORTANT: dedup):
+- If multiple candidate dependencies are essentially the SAME kind of relationship, output ONLY ONE representative dependency and ignore the rest.
+- Goal: Do NOT generate too many dependencies. Prefer fewer, high-confidence, representative dependencies over exhaustive coverage.
+
+Output format — Return ONLY one valid JSON object:
+{
+  "data_dependencies": {
+    "1": [0],
+    "2": [0, 3]
+  }
+}
+```
+
+**k) `filter_fdg_prompt`** — FDG 节点筛选（`prompt.py:556`）
+
+> 过滤掉纯导航/低价值节点，仅保留有具体用户功能的节点用于测试。
+
+```text
+You are a mobile app testing expert.
+
+You are given a list of FDG nodes (functional points). Each node has:
+- an integer index
+- a short text description of what this node does in the app
+
+Your goal is to select which nodes are WORTH TESTING as independent test targets.
+
+## Selection Rules
+1. KEEP a node if its description shows a **concrete, user-visible functionality** (create / add / edit / delete / submit / save / confirm / search / filter / sort / share / export / import / login / register / sync, etc.).
+2. REMOVE a node if its description is **only navigation or very low-value** (pure navigation: open page, go to details, back, close, open tab, open menu, generic containers).
+3. If a node description is **too vague or unclear**, treat it as low-value navigation and REMOVE it.
+
+Output format:
+{"to_test_nodes": [0, 3, 5]}
+Do not add explanations, comments, or any other fields.
+```
+
+---
+
+##### D. Phase 4: 测试阶段
+
+**l) `test_function_prompt`** — 功能测试 Agent 指令（`prompt.py:115`）
+
+> 控制测试 Agent 的行为空间和输出格式。支持 `click`/`input`/`long_click`/`press_back`/`finished` 五种动作。
+
+```text
+You are a GUI testing agent. Your goal is to test a specific function on the current app screen according to the user's instruction.
+
+## Action Space
+You can only use these actions:
+- `click(point='<point>x y</point>')`: Click a coordinate.
+- `long_click(point='<point>x y</point>')`: Long click a coordinate.
+- `input(content='...')`: Input text (use "\n" to confirm or submit).
+- `press_back()`: Press the back button.
+- `finished(content='xxx')`: Mark the task as fully complete.
+
+## Important Notes
+If an action causes **any abnormal situation**, **immediately stop** and output a `finished` action with a short reason.
+Abnormal situations include: App crash or unexpected close, Wrong or unexpected page jump, Page freeze or no response to interaction, UI layout corruption or broken display, Any unexpected or undefined behavior.
+Example: `Action: finished(content='App crashed after clicking the button.')`
+
+## Output Format
+Return exactly in the following format:
+Thought: [Brief reasoning about what to do next]
+Action: [A single valid action from the Action Space]
+Description: [A short natural-language description of what this action does]
+
+## Function to Test
+{instruction}
+```
+
+**m) `TASK_MUTATION_PROMPT`** — Task 级变异测试用例生成（`explorer.py:1247` 内联）
+
+> 对每个 FDG 节点的 core_logic，生成 2~3 个变异路径（分支变异、顺序变异、重复/省略、边界输入）。
+
+```text
+You are generating MUTATION test cases for a mobile app functional point.
+
+You will be given:
+- Functional point description
+- Core logic summary (natural language)
+- widget_descriptions: a list of UI widgets/actions descriptions available within this functional point (strings)
+
+HARD CONSTRAINT (MUST FOLLOW):
+- You can ONLY interact with widgets that appear in widget_descriptions.
+- When you reference a widget, you MUST copy its description EXACTLY and wrap it using <....>.
+  Example: Tap <Add note>, Long-press <Item options>, Input "abc" into <Title field>.
+- Do NOT mention any other buttons/menus/settings not in widget_descriptions.
+- If you cannot generate valid mutations using only these widgets, return an empty list.
+
+Mutation goals (high-risk):
+1) Branch mutation: choose alternative widgets/options among the list.
+2) Order mutation: swap two independent steps if plausible.
+3) Repeat/omit: repeat an operation or omit a step (e.g., try saving without input).
+4) Boundary input: empty / very long / special chars ONLY if input is plausible.
+
+Output STRICT JSON ONLY:
+{
+  "variant_paths": [
+    "natural language task 1",
+    "natural language task 2"
+  ]
+}
+The length of variant_paths must be less than or equal to 3.
+```
+
+**n) `APP_LEVEL_PLAN_PROMPT`** — 跨功能测试用例规划（`explorer.py:1442` 内联）
+
+> 对每对 (Producer, Consumer) 依赖，生成跨功能测试用例。
+
+```text
+You are an expert in cross-functional testing for mobile apps.
+
+You are given two functional points with a data dependency: Producer -> Consumer.
+Producer produces/updates some abstract data_out that may be consumed by Consumer via data_in.
+
+Your task:
+Generate a LIST of cross-functional test cases to validate the dependency across these two functions.
+
+Requirements:
+- Each test case MUST execute the Producer first to create/update the required data, then execute the Consumer to use/view/edit that data.
+- Provide clear natural-language task instructions that a UI testing agent can follow.
+- Focus on verifying the dependency: the Consumer should reflect/use the data produced by the Producer.
+- Do NOT invent steps that are not supported by the provided core_logic steps; you may rephrase core_logic into tasks.
+- Output no more than 2 test cases.
+
+Output STRICT JSON ONLY (and nothing else):
+[
+  {
+    "producer_task": "<natural-language task for producer core logic>",
+    "consumer_task": "<natural-language task for consumer core logic>"
+  }
+]
+```
+
+**o) `get_widget_test_prompt`** — Widget 级单控件测试（`prompt.py:219`）
+
+```text
+You are a mobile app GUI testing assistant.
+
+You will receive:
+1) A screenshot of the current page.
+2) A text description of ONE target widget to test.
+
+Your task:
+Based on the screenshot and the target widget, design simple test cases.
+Each test case MUST contain exactly:
+- ONE action (click or input).
+- ONE context (only used when action = "input", otherwise MUST be an empty string "").
+- ONE postcondition (the expected result after this operation).
+
+Rules for action:
+- The "action" field must be exactly one of: "click", "input".
+- Across ALL test cases: "click" can appear AT MOST ONCE. "input" can appear AT MOST ONCE.
+- If action = "input", then "context" MUST be non-empty.
+- If action = "click", then "context" MUST be exactly "".
+
+Output format — Return ONLY a JSON object with NO extra text:
+{
+  "tests": [
+    {"action": "click", "context": "", "postcondition": "The details dialog is shown."},
+    {"action": "input", "context": "typed empty title", "postcondition": "An error message is shown."}
+  ]
+}
+```
+
+**p) Widget 级测试流生成 prompt** — Widget test flow（`explorer.py:1150` 内联 f-string）
+
+```text
+You are a mobile app GUI testing assistant.
+
+You are given:
+1) A screenshot of a page.
+2) The natural-language description of ONE interactive widget on this page.
+
+Your task:
+1. Design a short TEST FLOW (string description) that exercises ONLY this widget.
+2. Predict the EXPECTED RESULT (string description) of this flow.
+
+Rules:
+- Focus ONLY on this widget.
+- The flow should be a sequence of actions described in natural language (e.g., "1. Click X. 2. Input Y.").
+- Use realistic example text if input is needed.
+- Keep it concise (3-5 steps max).
+
+Return ONLY one JSON object with exactly two keys: "steps" and "expected_result".
+Format example:
+{
+    "steps": "1. Tap the search bar. 2. Input 'test item'. 3. Tap the search icon.",
+    "expected_result": "The search results page is displayed showing items related to 'test item'."
+}
+
+Widget description: "{widget_desc}"
+```
+
+**q) `task_planning_prompt`** — 测试路径规划（`prompt.py:522`）
+
+> 生成 1 个主路径 + 2~3 个变体路径（边界/异常测试）。
+
+```text
+You are a Mobile App QA Automation Expert.
+
+Your Task:
+Based on the function description and the provided UI context, generate test paths for: "{task_description}".
+
+You must generate two types of paths:
+1. **One Main Path (Happy Path)**: The standard, successful sequence of actions to complete the task perfectly.
+2. **2-3 Variant Paths (Edge Cases/Negative Tests)**:
+   - Deviate from the main path to test robustness.
+   - Examples: Skipping optional steps, omitting required inputs, attempting actions in wrong order, or submitting empty forms.
+
+### Output Format
+Return a single JSON object:
+{
+  "main_path": "String describing the steps. Format: 1. [Action]... 2. [Action]...",
+  "variant_paths": [
+    "String for Variant 1. Format: 1. [Action]...",
+    "String for Variant 2..."
+  ]
+}
+
+### Example Strategy
+If the task is "Login":
+- "main_path": "1. Input username. 2. Input password. 3. Tap Login."
+- "variant_paths": ["1. Input username. 2. Tap Login (Skip password).", "1. Tap Login (Empty fields)."]
+
+Do NOT include markdown code blocks (```json). Return raw JSON only.
+```
+
+---
+
+##### E. Phase 5: Bug 检测
+
+**r) `bug_detection_prompt`** — 实时 Bug 检测（`prompt.py:323`）
+
+> 在探索过程中，每执行一个动作后调用。对比前后截图 + 动作描述，判断是否出现 crash 或 functional bug。
+
+```text
+You are a mobile app testing assistant.
+
+You will receive:
+- Screenshot before a user action.
+- Screenshot after the user action.
+- A description of the user action.
+
+Your task: Decide whether there is a bug.
+
+You should focus on two categories:
+1) Crash bugs
+2) Functional bugs
+
+### 1. Crash Bugs
+Crash bugs ONLY include:
+- Explicit app crash dialogs (e.g., "App has stopped", "App keeps stopping").
+- The app process exits after the action and the system home screen (launcher/desktop) is shown.
+
+### 2. Functional Bugs
+A functional bug means: the app runs, but the actual result after this action clearly does NOT match the expected state.
+
+Typical functional bugs include:
+- An operation that should update something, but no update happens at all.
+- Data is updated incorrectly (wrong value displayed, obviously wrong calculation result, incorrect total or count).
+- Data is missing or duplicated (newly added item does not appear in the list, same item appears twice).
+
+IMPORTANT:
+- Do NOT treat minor visual or layout differences as functional bugs.
+- Do NOT treat navigation to an unexpected page or screen as a functional bug by itself.
+- Do NOT treat informational messages, reminders, warnings, tips, guidance prompts, or toast messages as bugs.
+- Do NOT treat blank or empty pages resulting from incomplete loading as functional bugs.
+- Only consider an issue a functional bug if the application's functional behavior or data state clearly violates the expected outcome.
+
+Return ONLY one JSON object:
+{
+  "has_bug": true or false,
+  "bug_type": "crash" | "functional" | "none",
+  "bug_description": "Short description (<=50 words)"
+}
+```
+
+**s) `path_bug_detection_prompt`** — 路径级 Bug 检测（`prompt.py:156`）
+
+> 功能测试完成后调用。拥有完整执行序列上下文，可检测累积 bug。
+
+```text
+You are a Mobile App QA Expert.
+You are given a sequential execution log (Path Record) of an automated test.
+Each step contains a screenshot and a description of the state/action.
+
+Your task: Decide whether there is a bug.
+
+You should focus on two categories:
+1) Crash bugs — App crash dialogs, system error dialogs, completely blank/frozen screen.
+2) Functional bugs — The functional outcome clearly does NOT match the expected behavior:
+   - Operation should update something, but no update happens.
+   - Data is updated incorrectly.
+   - Data is missing or duplicated.
+   - A button that should be available is disabled or unresponsive.
+   - A confirmation message is inconsistent with the performed action.
+
+IMPORTANT:
+- Do NOT treat minor visual/layout changes as functional bugs.
+- Do NOT treat "navigated to an unexpected page" as a functional bug by itself.
+- Only consider navigation-related issues as a bug if they lead to a crash or completely broken state.
+- If you are not sure, be conservative and set has_bug = false.
+
+Return ONLY one JSON object:
+{
+  "has_bug": true or false,
+  "bug_type": "crash" | "functional" | "none",
+  "bug_description": "Short description (<=50 words)"
+}
+```
+
+**t) `bug_recheck_prompt`** — 知识库辅助 Bug 二次确认（`prompt.py:370`）
+
+> 更保守的判别策略：若与已知非 Bug 案例相似则判定为非 Bug。与知识库检索配合使用（当前代码中已注释）。
+
+```text
+You are a mobile app testing assistant.
+
+You will receive:
+- Screenshots before and after a user action for the CURRENT case.
+- A description of the user action.
+- Several NON-BUG reference examples from a knowledge base.
+  These reference examples represent NORMAL and CORRECT app behaviors and MUST NOT be considered defects.
+
+Your task:
+Re-evaluate whether the CURRENT case is truly a bug, by comparing it with the NON-BUG reference examples.
+
+You should be MORE conservative than the initial detection.
+
+Decision principles:
+- If the CURRENT case is semantically or visually similar to any NON-BUG reference example, then it is NOT a bug.
+- Only report a bug if the CURRENT case clearly violates the expected state AND is clearly different from all NON-BUG reference examples.
+
+Typical functional bugs include:
+- An operation that should update something, but no update happens at all.
+- Data is updated incorrectly (wrong value, wrong calculation, incorrect count).
+- Data is missing or duplicated unexpectedly.
+
+IMPORTANT:
+- Do NOT treat minor visual or layout differences as functional bugs.
+- Do NOT treat navigation to an unexpected page or screen as a functional bug by itself.
+- Do NOT treat informational messages, reminders, warnings, tips, or confirmation dialogs as bugs.
+- Do NOT treat blank or empty pages caused by incomplete loading as functional bugs.
+
+Final decision rule: If there is ANY reasonable doubt, choose NOT A BUG.
+
+Return ONLY one JSON object:
+{
+  "has_bug": true or false,
+  "bug_description": "Short description (<=50 words)"
+}
+```
+
+---
+
+##### F. 辅助/未使用 Prompts
+
+**u) `event_llm_prompt`** — 通用 GUI Agent（`prompt.py:298`）
+
+> 旧版 GUI agent prompt，仅支持 click/long_click/input 三种动作。当前代码未使用。
+
+```text
+You are a GUI agent designed to follow instructions and interact with a user interface.
+
+## Action Space
+Your **only** available actions are:
+- `click(point='<point>x y</point>')`: Clicks a specific coordinate on the screen.
+- `long_click(point='<point>x y</point>')`: Performs a long click at the specified coordinate.
+- `input(point='<point>x y</point>', content='...')`: Inputs the given content. To submit after typing, append "\n".
+
+## Output Format
+You **MUST** return your response in the following format:
+Action: [A single action from the Action Space]
+
+## User Instruction
+{instruction}
+```
+
+**v) `page_to_page_prompt`**（`prompt.py:437`）— 边分类备选
+
+> 与 `FDG_EDGE_CLASSIFY_PROMPT`（explorer.py 内联版）功能相同，但 prompt.py 版本更简洁。实际运行使用的是 explorer.py 内联版。
+
+```text
+You are a mobile app interaction expert.
+Given a user action description and two screenshots (before and after the action), analyze the interaction to determine functional changes and specific data flow.
+
+### Part 1: New Functional Point Detection
+A "New Functional Point" represents a distinct change in the functional context or the emergence of a new interactive layer.
+
+**Return `true` (New Functional Point) if:**
+1. Page Navigation: Full-screen transition.
+2. Tab/Module Switching: Switching major modules.
+3. Modal/Dialogs: Popup/Alert requiring attention.
+4. Bottom Sheets/Action Panels: Panels offering distinct actions.
+5. Side Drawers: Navigation drawer slides in.
+
+**Return `false` (Same Functional Point) if:**
+1. Inline UI Changes: Expanding accordions, "read more".
+2. Simple Inputs: Typing, toggling switches, checkboxes.
+3. Dropdowns/Menus: Simple selection within a form.
+4. Transient UI: Toasts, loading spinners.
+5. Scroll/Swipe: Moving viewport without structural change.
+
+### Part 2: Concrete Data Flow Analysis (STRICT)
+Identify the **SPECIFIC** data entities consumed or produced.
+**DO NOT use vague terms** like "User Data", "Settings", "Info", "Input".
+- **data_in**: Specific entities used/required (e.g., "Note Title", "Search Keyword", "Login Credentials")
+- **data_out**: Specific entities created/modified/loaded (e.g., "Created Note Entry", "Filtered Product List", "WiFi State: On")
+- **Empty Rule**: If the action is purely navigational with no data logic, return [].
+
+### Output format
+Return exactly one JSON object:
+{
+  "new_functional_point": true or false,
+  "data_in": ["string", ...],
+  "data_out": ["string", ...]
+}
+Do not include explanations or any extra text.
+```
+
+**w) `FDG_function_description_prompt`**（`prompt.py:414`）— FDG 节点描述备选
+
+> prompt.py 版本，与 explorer.py 内联版功能一致但变量命名不同（snake_case vs UPPER）。运行使用的是内联版。
+
+```text
+You are a mobile app functional analysis expert. The app you are analyzing is {app_name}.
+
+You will be given:
+1. The full navigation path that led to the current page (including pages and user actions).
+2. A screenshot of the current page.
+
+Your task:
+Summarize the function of the current page in the context of the entire navigation path.
+
+Rules:
+- Do NOT describe individual buttons or UI components.
+- Do NOT repeat the navigation path.
+- Do NOT include explanations or reasoning.
+
+Navigation Path: {path_description}
+
+Output Format:
+Return only a concise, high-level functional description. No explanations, reasoning, or JSON structure.
+```
+
+---
+
+##### 汇总表
+
+| # | Prompt 名称 | 位置 | 阶段 | 用途 |
+|---|---|---|---|---|
+| a | `initial_page_prompt` | prompt.py:63 | PTG 探索 | 首页控件识别（Bottom Tab 全枚举） |
+| b | `get_widgets_from_page_prompt` | prompt.py:1 | PTG 探索 | 前后页面对比提取新增交互控件 |
+| c | `get_position_prompt` | prompt.py:268 | PTG 探索 | Widget 坐标重定位 |
+| d | `page_exist_prompt` | prompt.py:662 | PTG 探索 | 页面去重 LLM 视觉比对 |
+| e | `FDG_EDGE_CLASSIFY_PROMPT` | explorer.py:141 | FDG 构建 | PTG 边分类：新功能点判断 + data_in/out |
+| f | `FDG_FUNCTION_DESCRIPTION_PROMPT` | explorer.py:202 | FDG 构建 | FDG 节点功能描述 |
+| g | `FDG_CORE_LOGIC_PROMPT` | explorer.py:214 | FDG 构建 | FDG 节点核心逻辑提取（流程图结构） |
+| h | `page_to_widget_prompt` | prompt.py:483 | FDG 构建 | Widget 级功能点判断 |
+| i | `data_flow_prompt` | prompt.py:596 | 数据依赖 | 推断 FDG 节点间依赖（高召回） |
+| j | `data_flow_prompt_without_data` | prompt.py:697 | 数据依赖 | 推断依赖（高精度，无 data_in/out） |
+| k | `filter_fdg_prompt` | prompt.py:556 | 数据依赖 | FDG 节点筛选（过滤纯导航） |
+| l | `test_function_prompt` | prompt.py:115 | 测试 | 功能测试 Agent 指令 |
+| m | `TASK_MUTATION_PROMPT` | explorer.py:1247 | 测试 | Task 级变异测试用例生成 |
+| n | `APP_LEVEL_PLAN_PROMPT` | explorer.py:1442 | 测试 | 跨功能测试用例规划 |
+| o | `get_widget_test_prompt` | prompt.py:219 | 测试 | Widget 级单控件测试 |
+| p | Widget test flow prompt | explorer.py:1150 | 测试 | Widget 测试流生成（内联 f-string） |
+| q | `task_planning_prompt` | prompt.py:522 | 测试 | 测试路径规划（主路径 + 变体） |
+| r | `bug_detection_prompt` | prompt.py:323 | Bug 检测 | 实时 Bug 检测（探索中） |
+| s | `path_bug_detection_prompt` | prompt.py:156 | Bug 检测 | 路径级 Bug 检测（测试后） |
+| t | `bug_recheck_prompt` | prompt.py:370 | Bug 检测 | 知识库辅助 Bug 二次确认 |
+| u | `event_llm_prompt` | prompt.py:298 | 未使用 | 旧版 GUI Agent prompt |
+| v | `page_to_page_prompt` | prompt.py:437 | 未使用 | 边分类备选（被内联版覆盖） |
+| w | `FDG_function_description_prompt` | prompt.py:414 | 未使用 | FDG 描述备选（被内联版覆盖） |
 
 #### 3.3.3 Explorer 类（`explorer.py`）- 核心引擎
 

@@ -390,16 +390,22 @@ def main():
     device = Device(device_serial, OperatingSystem.ANDROID)
     step_ok("设备对象已创建 (Connector: ADB, Automator: uiautomator2)")
 
-    step(f"卸载旧版本 (如果存在): {app.package_name}")
-    try:
-        device.uninstall_app(app)
-        step_ok("旧版本已卸载")
-    except Exception:
-        step_ok("无需卸载 (首次安装)")
+    # 检查 App 是否已安装
+    rc, out, _ = run_cmd(f"adb shell pm list packages {app.package_name}")
+    app_installed = (out.strip() == f"package:{app.package_name}")
 
-    step(f"安装 APK...")
-    device.install_app(app)
-    step_ok("APK 安装完成")
+    if app_installed:
+        step_ok(f"设备上已安装 {app.package_name}，跳过卸载和安装")
+    else:
+        step(f"清理旧版本 (如果存在): {app.package_name}")
+        try:
+            device.uninstall_app(app)
+        except Exception:
+            pass
+
+        step(f"安装 APK...")
+        device.install_app(app)
+        step_ok("APK 安装完成")
 
     step("授予运行时权限...")
     grant_all_permissions(app.package_name)
