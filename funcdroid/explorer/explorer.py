@@ -52,7 +52,7 @@ class Explorer:
         self.page_nodes: list[PageNode] = []
         self.FDG: list[FDGNode] = []
 
-        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.executor = ThreadPoolExecutor(max_workers=4)
 
         self.path = []
 
@@ -472,7 +472,7 @@ Output STRICT JSON (NO extra text, NO markdown):
         processed_edges = set()                 # (src_page_idx, edge_idx)
         expanded_state = set([(start_node.index, 0)])  # (page_idx, fdg_id)
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             while not q.empty():
                 batch = []
                 while not q.empty():
@@ -1680,7 +1680,7 @@ Output STRICT JSON ONLY (and nothing else):
                     "role": "assistant",
                     "content": [
                         {
-                            "type": "input_text",
+                            "type": "output_text",
                             "text": response
                         }
                     ]

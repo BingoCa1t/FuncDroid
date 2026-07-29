@@ -1,8 +1,13 @@
 from dotenv import load_dotenv
 import os
-from openai import OpenAI
+import time
+from openai import OpenAI, APIStatusError, APITimeoutError, APIConnectionError
 from threading import Lock
 from typing import Any, Dict
+
+# ---- configurable retry settings ----
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+LLM_RETRY_BACKOFF_BASE = float(os.getenv("LLM_RETRY_BACKOFF_BASE", "2.0"))
 
 TOKEN_LOCK = Lock()
 LLM_LOCK = Lock()  # serialise all LLM API calls — the backend does not support concurrency
@@ -15,6 +20,11 @@ TOKEN_STATS: Dict[str, int] = {
 }
 
 TOKEN_LOGS = []  # list[dict]
+
+# 模块级标志：API 是否支持 thinking 参数
+# 设置环境变量 LLM_DISABLE_THINKING=true 可全局关闭
+# 若不设置，首次调用时自动检测，不支持则自动跳过
+_THINKING_SUPPORTED = os.getenv("LLM_DISABLE_THINKING", "").lower() not in ("1", "true", "yes")
 
 def _extract_usage(resp: Any) -> Dict[str, int]:
     """
@@ -90,6 +100,8 @@ client_llm = OpenAI(
 client_uitars = OpenAI(
     base_url=os.getenv("SPECIALIZED_BASE_URL"),
     api_key=os.getenv("SPECIALIZED_API_KEY"),
+    timeout=120.0,     # 120s per-request timeout — avoids hanging forever
+    max_retries=0,      # we handle retries ourselves with backoff
 )
 
 # def ask_llm(content):
@@ -104,78 +116,100 @@ client_uitars = OpenAI(
 #     return resp.output_text
 
 
+def _call_llm_with_retry(tag: str, fn):
+    """
+    Call fn() with LLM_LOCK serialisation and automatic retry on transient errors.
+    fn() should return the OpenAI response object.
+    """
+    global _THINKING_SUPPORTED
+    last_exc = None
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            with LLM_LOCK:
+                resp = fn()
+            _add_usage(resp, tag=tag, model=os.getenv("SPECIALIZED_MODEL") or "")
+            return resp.output_text
+        except (APIStatusError, APITimeoutError, APIConnectionError) as e:
+            last_exc = e
+            status = getattr(e, 'status_code', None)
+
+            # 自动检测 API 是否不支持 'thinking' 参数，若不支持则全局禁用并重试
+            if status == 400 and _THINKING_SUPPORTED:
+                err_text = str(e)
+                # e.body 可能是 dict 或 str，统一转为字符串检测
+                if hasattr(e, 'body'):
+                    err_text += str(e.body)
+                if 'thinking' in err_text:
+                    _THINKING_SUPPORTED = False
+                    print(f"[LLM:{tag}] API does not support 'thinking' param, retrying without it ...")
+                    continue  # fn() 闭包内会读取 _THINKING_SUPPORTED 决定是否传 extra_body
+
+            retryable = status in (429, 502, 503, 504) if status else True
+            if not retryable and status is not None and status < 500:
+                raise  # 4xx (non-429) = client error, don't retry
+            if attempt == LLM_MAX_RETRIES:
+                raise
+            delay = max(LLM_RETRY_BACKOFF_BASE ** attempt, 2.0)
+            if status == 502:
+                delay = max(delay, 60.0)  # Cloudflare asks for >= 60s
+            elif status is None:
+                # timeout / connection error — server already struggled for 120s,
+                # give it real time to recover before retrying
+                delay = max(delay, 30.0)
+            print(f"[LLM:{tag}] attempt {attempt}/{LLM_MAX_RETRIES} failed ({type(e).__name__}"
+                  f"{f' status={status}' if status else ''}), retrying in {delay:.0f}s ...")
+            time.sleep(delay)
+
+    raise last_exc  # type: ignore
+
+
+def _extra_body():
+    """返回 extra_body，若 API 不支持 thinking 参数则返回 None"""
+    return {"thinking": {"type": "disabled"}} if _THINKING_SUPPORTED else None
+
+
 def ask_llm(content):
-    with LLM_LOCK:
-        resp = client_uitars.responses.create(
+    def _call():
+        return client_uitars.responses.create(
             model=os.getenv("SPECIALIZED_MODEL"),
-            input=[{
-                "role": "user",
-                "content": content
-            }],
+            input=[{"role": "user", "content": content}],
             temperature=0,
-            extra_body={
-                "thinking": {
-                    "type": "disabled",
-                },
-            },
+            extra_body=_extra_body(),
         )
-        # print(resp.output_text)
-        _add_usage(resp, tag="ask_llm", model=os.getenv("SPECIALIZED_MODEL") or "")
-        return resp.output_text
+    return _call_llm_with_retry("ask_llm", _call)
 
 
 def ask_uitars(content):
-    with LLM_LOCK:
-        resp = client_uitars.responses.create(
+    def _call():
+        return client_uitars.responses.create(
             model=os.getenv("SPECIALIZED_MODEL"),
-            input=[{
-                "role": "user",
-                "content": content
-            }],
+            input=[{"role": "user", "content": content}],
             temperature=0,
-            extra_body={
-                "thinking": {
-                    "type": "disabled",
-                },
-            },
+            extra_body=_extra_body(),
         )
-        # print(resp.output_text)
-        _add_usage(resp, tag="ask_uitars", model=os.getenv("SPECIALIZED_MODEL") or "")
-        return resp.output_text
+    return _call_llm_with_retry("ask_uitars", _call)
+
 
 def ask_uitars_without_thinking(content):
-    with LLM_LOCK:
-        resp = client_uitars.responses.create(
+    def _call():
+        return client_uitars.responses.create(
             model=os.getenv("SPECIALIZED_MODEL"),
-            input=[{
-                "role": "user",
-                "content": content
-            }],
+            input=[{"role": "user", "content": content}],
             temperature=0,
-            extra_body={
-                "thinking": {
-                    "type": "disabled",
-                },
-            },
+            extra_body=_extra_body(),
         )
-        _add_usage(resp, tag="ask_uitars_without_thinking", model=os.getenv("SPECIALIZED_MODEL") or "")
-        return resp.output_text
+    return _call_llm_with_retry("ask_uitars_without_thinking", _call)
 
 
 def ask_uitars_messages(messages):
-    with LLM_LOCK:
-        resp = client_uitars.responses.create(
+    def _call():
+        return client_uitars.responses.create(
             model=os.getenv("SPECIALIZED_MODEL"),
             input=messages,
             temperature=0,
-            extra_body={
-                "thinking": {
-                    "type": "disabled",
-                },
-            },
+            extra_body=_extra_body(),
         )
-        _add_usage(resp, tag="ask_uitars_messages", model=os.getenv("SPECIALIZED_MODEL") or "")
-        return resp.output_text
+    return _call_llm_with_retry("ask_uitars_messages", _call)
 
 
 
